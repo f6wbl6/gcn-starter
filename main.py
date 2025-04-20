@@ -1,8 +1,5 @@
-import logging
-from typing import List
 from pathlib import Path
 
-import numpy # Explicitly import numpy first
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,20 +8,25 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv
 
-from config import settings # Import settings
+from config import ModelSettings, model_settings, settings
+from logger import set_logger
 
-# Configure logging - Moved to main block
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Initialize logger using the custom function
+logger = set_logger()
 
 
 class GCN(nn.Module):
-    def __init__(self, num_node_features: int, num_classes: int):
+    def __init__(self, settings: ModelSettings):
         super(GCN, self).__init__()
-        self.conv1 = GCNConv(num_node_features, 16)
-        self.conv2 = GCNConv(16, num_classes)
+        self.conv1 = GCNConv(settings.num_node_features, settings.hidden_dim)
+        self.conv2 = GCNConv(settings.hidden_dim, settings.num_classes)
 
     def forward(self, data: Data) -> torch.Tensor:
-        x, edge_index, _ = data.x, data.edge_index, data.batch # Use _ for unused batch variable
+        x, edge_index, _ = (
+            data.x,
+            data.edge_index,
+            data.batch,
+        )  # Use _ for unused batch variable
 
         x = self.conv1(x, edge_index)
         x = F.relu(x)
@@ -57,6 +59,18 @@ class GCN(nn.Module):
             out = self(data)
             pred = out.argmax(dim=1)
         return pred
+
+    def get_embeddings(self, data: Data) -> torch.Tensor:
+        """Extracts node embeddings from the second-to-last layer."""
+        self.eval()
+        with torch.no_grad():
+            x, edge_index, _ = data.x, data.edge_index, data.batch
+            x = self.conv1(x, edge_index)
+            x = F.relu(x)
+            # Embeddings are the output of the first GCN layer after ReLU
+            # Optionally, could add dropout here if desired during inference, but typically not.
+            # x = F.dropout(x, training=self.training) # Usually False during eval
+        return x
 
     def fit(
         self,
@@ -93,7 +107,6 @@ class GCN(nn.Module):
         Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
         Path(mlflow_log_path).parent.mkdir(parents=True, exist_ok=True)
 
-
         best_val_loss = float("inf")
         epochs_without_improvement = 0
         best_model_state = None
@@ -122,24 +135,24 @@ class GCN(nn.Module):
                 epochs_without_improvement = 0
                 best_model_state = self.state_dict()
                 torch.save(best_model_state, checkpoint_path)
-                logging.info(
+                logger.info(
                     f"Epoch {epoch}: Validation loss improved to {best_val_loss:.4f}. Saving checkpoint."
                 )
             else:
                 epochs_without_improvement += 1
-                logging.info(
+                logger.info(
                     f"Epoch {epoch}: Validation loss did not improve. Patience: {epochs_without_improvement}/{patience}"
                 )
                 if epochs_without_improvement > patience:
-                    logging.info("Early stopping triggered")
+                    logger.info("Early stopping triggered")
                     break
 
         # Load best model
         if best_model_state is not None:
             self.load_state_dict(best_model_state)
-            logging.info(f"Loaded best model from {checkpoint_path}")
+            logger.info(f"Loaded best model from {checkpoint_path}")
         else:
-            logging.info("No improvement during training, using initial model")
+            logger.info("No improvement during training, using initial model")
 
     def _train_epoch(
         self, data_loader: DataLoader, optimizer: optim.Optimizer, criterion: nn.Module
@@ -164,7 +177,7 @@ class GCN(nn.Module):
                 total_loss += loss
                 num_batches += 1
         # Avoid division by zero if data_loader is empty
-        return total_loss / num_batches if num_batches > 0 else float('inf')
+        return total_loss / num_batches if num_batches > 0 else float("inf")
 
     def _test_epoch(self, data_loader: DataLoader) -> float:
         self.eval()
@@ -183,29 +196,25 @@ class GCN(nn.Module):
 
 
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    # Note: Logging is configured globally when logger is initialized
 
     # Generate dummy data
     edge_index = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long)
     x = torch.randn(3, 16)  # 3 nodes, 16 features
-    y = torch.tensor([0, 1, 0], dtype=torch.long)  # Example labels
+    y = torch.tensor([[0], [1], [0]], dtype=torch.long)  # Example labels
     data = Data(x=x, edge_index=edge_index, y=y)
 
-    # Model parameters
-    num_node_features = data.num_node_features
-    num_classes = 2  # Binary classification
+    # Initialize the model parameters
+    # num_node_features = data.num_node_features
+    # num_classes = 2  # Binary classification
 
-    # Initialize the model
-    model = GCN(num_node_features, num_classes)
+    # Initialize the model, passing in settings
+    model = GCN(model_settings)
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.NLLLoss()
 
-    # Create a DataLoader for batch learning
-    # Use torch_geometric.loader
     from torch_geometric.loader import DataLoader
+
     data_loader = DataLoader([data], batch_size=2, shuffle=True)
 
     # Construct paths using settings
@@ -214,13 +223,12 @@ if __name__ == "__main__":
     checkpoint_path = str(settings.checkpoint_dir / checkpoint_file)
     mlflow_log_path = str(settings.log_dir / log_file)
 
-
     # Fit the model
     model.fit(
         data_loader,
         optimizer,
         criterion,
-        epochs=5, # Reduced epochs for quick demo
+        epochs=5,  # Reduced epochs for quick demo
         patience=2,
         checkpoint_path=checkpoint_path,
         mlflow_log_path=mlflow_log_path,
